@@ -1,0 +1,127 @@
+import { 
+  collection, 
+  addDoc, 
+  updateDoc, 
+  deleteDoc, 
+  doc, 
+  query, 
+  where, 
+  onSnapshot,
+  orderBy,
+  serverTimestamp,
+  FirestoreError
+} from 'firebase/firestore';
+import { db, auth } from './firebase';
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+// Reusable hook-like listeners (could be real hooks in a more complex app)
+export function subscribeToCollection<T>(
+  collectionName: string, 
+  callback: (data: T[]) => void,
+  userSpecific: boolean = true
+) {
+  // If userSpecific is requested but no user is logged in, we shouldn't even try to subscribe
+  // unless we're an admin, but that check happens inside. 
+  // For the client, we wait for auth.
+  
+  if (userSpecific && !auth.currentUser) {
+    console.warn(`Attempted to subscribe to ${collectionName} without an active user.`);
+    return () => {}; // return empty unsubscribe
+  }
+
+  let q = query(collection(db, collectionName));
+  
+  if (userSpecific && auth.currentUser) {
+    q = query(collection(db, collectionName), where('userId', '==', auth.currentUser.uid));
+  }
+
+  return onSnapshot(q, (snapshot) => {
+    const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as T));
+    
+    // Sort on client side to avoid missing index errors (403 Forbidden)
+    const sortedData = [...data].sort((a: any, b: any) => {
+      const getTime = (val: any) => {
+        if (!val) return 0;
+        if (typeof val.toMillis === 'function') return val.toMillis();
+        if (typeof val === 'number') return val;
+        return new Date(val).getTime() || 0;
+      };
+      return getTime(b.createdAt) - getTime(a.createdAt);
+    });
+    
+    callback(sortedData);
+  }, (error) => {
+    // Only handle if it's not a cancelled listener
+    if (error.code !== ('cancelled' as any)) {
+      handleFirestoreError(error, OperationType.GET, collectionName);
+    }
+  });
+}
+
+export async function addRecord(collectionName: string, data: any) {
+  try {
+    if (!auth.currentUser) throw new Error('Not authenticated');
+    const docRef = await addDoc(collection(db, collectionName), {
+      ...data,
+      userId: auth.currentUser.uid,
+      createdAt: serverTimestamp(),
+    });
+    return docRef.id;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, collectionName);
+  }
+}
+
+export async function updateRecord(collectionName: string, id: string, data: any) {
+  try {
+    const docRef = doc(db, collectionName, id);
+    await updateDoc(docRef, data);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `${collectionName}/${id}`);
+  }
+}
+
+export async function deleteRecord(collectionName: string, id: string) {
+  try {
+    const docRef = doc(db, collectionName, id);
+    await deleteDoc(docRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `${collectionName}/${id}`);
+  }
+}
